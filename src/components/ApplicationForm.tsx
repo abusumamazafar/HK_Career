@@ -1,12 +1,16 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
   Clock,
-  ExternalLink,
+  FileText,
+  ImagePlus,
+  Loader2,
   MapPin,
   Phone,
   RotateCcw,
+  Trash2,
+  Upload,
 } from 'lucide-react';
 import { COMPANY_INFO, JOB_ROLES, JobRoleId } from '../data/jobs';
 
@@ -23,15 +27,43 @@ interface FormErrors {
   confirmedLocation?: string;
 }
 
+interface UploadedFileInfo {
+  fileName: string;
+  sizeBytes: number;
+  url: string;
+  previewUrl?: string;
+}
+
 const EXPERIENCE_OPTIONS = ['Less than 1 Year', '1–2 Years', '3–5 Years', '5+ Years'];
 const AVAILABILITY_OPTIONS = ['Immediate', 'Within 1 Week', '2 Weeks – 1 Month'];
 const GENDER_OPTIONS = ['Male', 'Female'];
+
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
+const MAX_CV_BYTES = 10 * 1024 * 1024;
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ''));
+    reader.onerror = () => reject(new Error('Failed to read selected file.'));
+    reader.readAsDataURL(file);
+  });
+}
 
 export const ApplicationForm: React.FC<ApplicationFormProps> = ({
   selectedRole,
   onSelectRole,
 }) => {
   const activeRole = JOB_ROLES.find((r) => r.id === selectedRole) ?? JOB_ROLES[0];
+
+  const photoInputRef = useRef<HTMLInputElement | null>(null);
+  const cvInputRef = useRef<HTMLInputElement | null>(null);
 
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
@@ -43,13 +75,142 @@ export const ApplicationForm: React.FC<ApplicationFormProps> = ({
   const [availability, setAvailability] = useState('Immediate');
   const [confirmedLocation, setConfirmedLocation] = useState(false);
 
+  const [profilePhoto, setProfilePhoto] = useState<UploadedFileInfo | null>(null);
+  const [photoUploading, setPhotoUploading] = useState(false);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+
+  const [cvFile, setCvFile] = useState<UploadedFileInfo | null>(null);
+  const [cvUploading, setCvUploading] = useState(false);
+  const [cvError, setCvError] = useState<string | null>(null);
+
   const [errors, setErrors] = useState<FormErrors>({});
-  const [submittedMessage, setSubmittedMessage] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submittedRecordId, setSubmittedRecordId] = useState<string | null>(null);
 
   useEffect(() => {
     setQualification(activeRole.qualificationOptions[0]);
-    setSubmittedMessage(null);
+    setSubmittedRecordId(null);
+    setSubmitError(null);
   }, [activeRole.id]);
+
+  useEffect(() => {
+    return () => {
+      if (profilePhoto?.previewUrl) {
+        URL.revokeObjectURL(profilePhoto.previewUrl);
+      }
+    };
+  }, [profilePhoto?.previewUrl]);
+
+  const uploadFile = async (kind: 'photo' | 'cv', file: File) => {
+    const isPhoto = kind === 'photo';
+    const maxBytes = isPhoto ? MAX_PHOTO_BYTES : MAX_CV_BYTES;
+
+    if (file.size > maxBytes) {
+      const msg = isPhoto
+        ? 'Profile image must be 5 MB or smaller.'
+        : 'CV file must be 10 MB or smaller.';
+      if (isPhoto) setPhotoError(msg);
+      else setCvError(msg);
+      return;
+    }
+
+    if (isPhoto) {
+      setPhotoError(null);
+      setPhotoUploading(true);
+    } else {
+      setCvError(null);
+      setCvUploading(true);
+    }
+
+    try {
+      const dataBase64 = await readFileAsDataUrl(file);
+      let hostedUrl = '';
+
+      try {
+        const response = await fetch('./api/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            kind,
+            fileName: file.name,
+            mimeType: file.type || '',
+            dataBase64,
+          }),
+        });
+
+        const contentType = response.headers.get('content-type') || '';
+        if (response.ok && contentType.includes('application/json')) {
+          const result = await response.json();
+          if (result?.url) {
+            hostedUrl = String(result.url).replace(/^\//, '');
+          }
+        } else if (response.status >= 400 && response.status < 500 && response.status !== 404 && response.status !== 405) {
+          const errData = contentType.includes('application/json') ? await response.json() : null;
+          throw new Error(errData?.error || 'Upload rejected. Please try another file.');
+        }
+      } catch (networkErr) {
+        if (networkErr instanceof Error && networkErr.message.includes('Upload rejected')) {
+          throw networkErr;
+        }
+        // Static hosting fallback (e.g. bundlenest.xyz/hkc without Node backend)
+      }
+
+      if (isPhoto) {
+        if (profilePhoto?.previewUrl) {
+          URL.revokeObjectURL(profilePhoto.previewUrl);
+        }
+        setProfilePhoto({
+          fileName: file.name,
+          sizeBytes: file.size,
+          url: hostedUrl,
+          previewUrl: URL.createObjectURL(file),
+        });
+      } else {
+        setCvFile({
+          fileName: file.name,
+          sizeBytes: file.size,
+          url: hostedUrl,
+        });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to process selected file.';
+      if (isPhoto) setPhotoError(message);
+      else setCvError(message);
+    } finally {
+      if (isPhoto) setPhotoUploading(false);
+      else setCvUploading(false);
+    }
+  };
+
+  const handlePhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      void uploadFile('photo', file);
+    }
+    e.target.value = '';
+  };
+
+  const handleCvChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      void uploadFile('cv', file);
+    }
+    e.target.value = '';
+  };
+
+  const clearPhoto = () => {
+    if (profilePhoto?.previewUrl) {
+      URL.revokeObjectURL(profilePhoto.previewUrl);
+    }
+    setProfilePhoto(null);
+    setPhotoError(null);
+  };
+
+  const clearCv = () => {
+    setCvFile(null);
+    setCvError(null);
+  };
 
   const validate = (): FormErrors => {
     const nextErrors: FormErrors = {};
@@ -79,61 +240,79 @@ export const ApplicationForm: React.FC<ApplicationFormProps> = ({
     return nextErrors;
   };
 
-  const buildApplicationPayload = (): string => {
-    const appliedAt = new Date().toLocaleDateString('en-PK', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric',
-    });
-
-    const lines = [
-      `*NEW JOB APPLICATION — ${COMPANY_INFO.name}*`,
-      `Applied Date: ${appliedAt}`,
-      '',
-      `*1. CANDIDATE PROFILE*`,
-      `• *Position Applied:* ${activeRole.title}`,
-      `• *Full Name:* ${fullName.trim()}`,
-      ...(activeRole.id === 'client-relations-officer' ? [`• *Gender:* ${gender}`] : []),
-      `• *Mobile Number:* ${phone.trim()}`,
-      `• *Current Area (Lahore):* ${area.trim()}`,
-      '',
-      `*2. EXPERIENCE & QUALIFICATION*`,
-      `• *Relevant Experience:* ${experience}`,
-      `• *${activeRole.qualificationLabel}:* ${qualification}`,
-      `• *Work Summary:* ${summary.trim()}`,
-      '',
-      `*3. AVAILABILITY & COMMUTE*`,
-      `• *Availability to Join:* ${availability}`,
-      `• *Office / Site Location:* Confirmed (${COMPANY_INFO.fullAddress})`,
-    ];
-    return lines.join('\n');
-  };
-
-  const buildSubmissionUrl = (message: string): string =>
-    `https://wa.me/${COMPANY_INFO.whatsappDigits}?text=${encodeURIComponent(message)}`;
-
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (photoUploading || cvUploading || submitting) {
+      return;
+    }
+
     const validationErrors = validate();
     setErrors(validationErrors);
+    setSubmitError(null);
 
     if (Object.keys(validationErrors).length > 0) {
       return;
     }
 
-    const formatted = buildApplicationPayload();
-    setSubmittedMessage(formatted);
+    setSubmitting(true);
+    try {
+      const res = await fetch('./api/applications', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roleId: activeRole.id,
+          roleTitle: activeRole.title,
+          fullName: fullName.trim(),
+          ...(activeRole.id === 'client-relations-officer' ? { gender } : {}),
+          phone: phone.trim(),
+          area: area.trim(),
+          experience,
+          qualification,
+          summary: summary.trim(),
+          availability,
+          profilePhoto: profilePhoto
+            ? {
+                fileName: profilePhoto.fileName,
+                sizeBytes: profilePhoto.sizeBytes,
+                url: profilePhoto.url,
+              }
+            : null,
+          cvFile: cvFile
+            ? {
+                fileName: cvFile.fileName,
+                sizeBytes: cvFile.sizeBytes,
+                url: cvFile.url,
+              }
+            : null,
+        }),
+      });
 
-    const anchor = document.createElement('a');
-    anchor.href = buildSubmissionUrl(formatted);
-    anchor.target = '_blank';
-    anchor.rel = 'noopener noreferrer';
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.id) {
+        throw new Error(data?.error || 'Could not submit application. Please try again.');
+      }
+
+      setSubmittedRecordId(String(data.id));
+    } catch (err) {
+      setSubmitError(
+        err instanceof Error ? err.message : 'Unable to reach hiring server. Please try again.'
+      );
+    } finally {
+      setSubmitting(false);
+    }
   };
 
-  const submissionUrl = submittedMessage ? buildSubmissionUrl(submittedMessage) : '#';
+  const resetForAnotherApplication = () => {
+    setSubmittedRecordId(null);
+    setSubmitError(null);
+    setFullName('');
+    setPhone('');
+    setArea('');
+    setSummary('');
+    setConfirmedLocation(false);
+    clearPhoto();
+    clearCv();
+  };
 
   return (
     <section id="apply-form" className="mx-auto max-w-7xl px-4 py-14 sm:px-6 sm:py-20 lg:px-8">
@@ -203,18 +382,21 @@ export const ApplicationForm: React.FC<ApplicationFormProps> = ({
 
         <div className="lg:col-span-7">
           <div className="rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
-            {submittedMessage ? (
+            {submittedRecordId ? (
               <div>
                 <div className="flex items-start gap-3 border-b border-slate-200 pb-6">
                   <CheckCircle2 className="mt-0.5 h-6 w-6 shrink-0 text-emerald-700" aria-hidden="true" />
                   <div>
                     <h3 className="font-display text-xl font-bold text-slate-900">
-                      Application Submitted
+                      Application Received
                     </h3>
                     <p className="mt-1 text-sm text-slate-600">
                       Thank you, <span className="font-semibold text-slate-900">{fullName.trim()}</span>.
                       Your application for <span className="font-semibold text-slate-900">{activeRole.title}</span>{' '}
-                      has been prepared for our hiring desk.
+                      has been recorded for our hiring team. Shortlisted candidates will be contacted directly.
+                    </p>
+                    <p className="mt-2 font-mono text-xs text-slate-500 tabular-nums">
+                      Reference ID: {submittedRecordId.slice(0, 8).toUpperCase()}
                     </p>
                   </div>
                 </div>
@@ -238,28 +420,41 @@ export const ApplicationForm: React.FC<ApplicationFormProps> = ({
                       {experience} · {availability}
                     </dd>
                   </div>
+                  <div>
+                    <dt className="text-xs font-medium text-slate-500">Profile Image</dt>
+                    <dd className="mt-1 flex items-center gap-2 text-slate-900">
+                      {profilePhoto ? (
+                        <>
+                          {profilePhoto.previewUrl && (
+                            <img
+                              src={profilePhoto.previewUrl}
+                              alt="Uploaded profile"
+                              className="h-7 w-7 rounded object-cover border border-slate-200"
+                            />
+                          )}
+                          <span className="truncate">{profilePhoto.fileName}</span>
+                        </>
+                      ) : (
+                        <span className="text-slate-500">Not attached</span>
+                      )}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-xs font-medium text-slate-500">CV / Resume</dt>
+                    <dd className="mt-1 truncate text-slate-900">
+                      {cvFile ? cvFile.fileName : <span className="text-slate-500">Not attached</span>}
+                    </dd>
+                  </div>
                 </dl>
-
-                <div className="mt-6 flex flex-col gap-3 sm:flex-row">
-                  <a
-                    href={submissionUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex min-h-[48px] flex-1 items-center justify-center gap-2 rounded-lg bg-slate-900 px-6 py-3 text-sm font-semibold text-white whitespace-nowrap transition-colors duration-150 hover:bg-slate-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600"
-                  >
-                    <span>Confirm &amp; Finalize Submission</span>
-                    <ExternalLink className="h-4 w-4 shrink-0" aria-hidden="true" />
-                  </a>
-                </div>
 
                 <div className="mt-6 flex items-center justify-between border-t border-slate-200 pt-5">
                   <button
                     type="button"
-                    onClick={() => setSubmittedMessage(null)}
-                    className="inline-flex min-h-[40px] items-center gap-1.5 text-sm font-medium text-slate-600 transition-colors hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                    onClick={resetForAnotherApplication}
+                    className="inline-flex min-h-[40px] items-center gap-1.5 text-sm font-medium text-slate-700 transition-colors hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
                   >
                     <RotateCcw className="h-4 w-4" aria-hidden="true" />
-                    <span>Edit Application Details</span>
+                    <span>Submit Another Application</span>
                   </button>
                   <p className="text-xs text-slate-500">
                     Direct Line: <span className="font-mono tabular-nums">{COMPANY_INFO.phoneDisplay}</span>
@@ -472,6 +667,142 @@ export const ApplicationForm: React.FC<ApplicationFormProps> = ({
                   )}
                 </div>
 
+                <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-900">
+                      Profile Image <span className="text-xs font-normal text-slate-500">(Optional · Max 5 MB)</span>
+                    </label>
+                    <input
+                      ref={photoInputRef}
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp"
+                      onChange={handlePhotoChange}
+                      className="sr-only"
+                      aria-label="Upload Profile Image"
+                    />
+                    {profilePhoto ? (
+                      <div className="mt-1.5 flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-[#F8F8F6] p-3">
+                        <div className="flex min-w-0 items-center gap-3">
+                          {profilePhoto.previewUrl && (
+                            <img
+                              src={profilePhoto.previewUrl}
+                              alt="Candidate profile preview"
+                              className="h-11 w-11 shrink-0 rounded-md border border-slate-200 object-cover"
+                            />
+                          )}
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-medium text-slate-900">
+                              {profilePhoto.fileName}
+                            </p>
+                            <p className="text-xs text-emerald-700 font-medium tabular-nums">
+                              Uploaded · {formatBytes(profilePhoto.sizeBytes)}
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={clearPhoto}
+                          aria-label="Remove profile image"
+                          className="inline-flex min-h-[40px] min-w-[40px] shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-200/70 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600"
+                        >
+                          <Trash2 className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => photoInputRef.current?.click()}
+                        disabled={photoUploading}
+                        className="mt-1.5 flex min-h-[68px] w-full items-center gap-3 rounded-lg border border-dashed border-slate-300 bg-[#F8F8F6] px-4 py-3 text-left transition-colors duration-150 hover:border-amber-600 hover:bg-amber-50/40 disabled:cursor-wait disabled:opacity-70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600"
+                      >
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600">
+                          {photoUploading ? (
+                            <Loader2 className="h-4 w-4 animate-spin text-amber-700" aria-hidden="true" />
+                          ) : (
+                            <ImagePlus className="h-4 w-4" aria-hidden="true" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <span className="block text-sm font-medium text-slate-900">
+                            {photoUploading ? 'Uploading Profile Image...' : 'Upload Profile Image'}
+                          </span>
+                          <span className="block text-xs text-slate-500">JPG, PNG, or WEBP</span>
+                        </div>
+                      </button>
+                    )}
+                    {photoError && (
+                      <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-700">
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                        <span>{photoError}</span>
+                      </p>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-slate-900">
+                      Upload CV / Resume <span className="text-xs font-normal text-slate-500">(Optional · Max 10 MB)</span>
+                    </label>
+                    <input
+                      ref={cvInputRef}
+                      type="file"
+                      accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                      onChange={handleCvChange}
+                      className="sr-only"
+                      aria-label="Upload CV or Resume"
+                    />
+                    {cvFile ? (
+                      <div className="mt-1.5 flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-[#F8F8F6] p-3">
+                        <div className="flex min-w-0 items-center gap-3">
+                          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-amber-700">
+                            <FileText className="h-5 w-5" aria-hidden="true" />
+                          </div>
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-medium text-slate-900">{cvFile.fileName}</p>
+                            <p className="text-xs text-emerald-700 font-medium tabular-nums">
+                              Uploaded · {formatBytes(cvFile.sizeBytes)}
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={clearCv}
+                          aria-label="Remove CV file"
+                          className="inline-flex min-h-[40px] min-w-[40px] shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-200/70 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600"
+                        >
+                          <Trash2 className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => cvInputRef.current?.click()}
+                        disabled={cvUploading}
+                        className="mt-1.5 flex min-h-[68px] w-full items-center gap-3 rounded-lg border border-dashed border-slate-300 bg-[#F8F8F6] px-4 py-3 text-left transition-colors duration-150 hover:border-amber-600 hover:bg-amber-50/40 disabled:cursor-wait disabled:opacity-70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600"
+                      >
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600">
+                          {cvUploading ? (
+                            <Loader2 className="h-4 w-4 animate-spin text-amber-700" aria-hidden="true" />
+                          ) : (
+                            <Upload className="h-4 w-4" aria-hidden="true" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <span className="block text-sm font-medium text-slate-900">
+                            {cvUploading ? 'Uploading CV...' : 'Upload CV / Resume'}
+                          </span>
+                          <span className="block text-xs text-slate-500">PDF, DOC, or DOCX</span>
+                        </div>
+                      </button>
+                    )}
+                    {cvError && (
+                      <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-700">
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                        <span>{cvError}</span>
+                      </p>
+                    )}
+                  </div>
+                </div>
+
                 <div>
                   <span className="block text-sm font-medium text-slate-900">
                     Availability to Join
@@ -520,11 +851,26 @@ export const ApplicationForm: React.FC<ApplicationFormProps> = ({
                   )}
                 </div>
 
+                {submitError && (
+                  <p className="flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs font-medium text-red-800 sm:text-sm">
+                    <AlertCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span>{submitError}</span>
+                  </p>
+                )}
+
                 <button
                   type="submit"
-                  className="inline-flex min-h-[48px] w-full items-center justify-center rounded-lg bg-slate-900 px-6 py-3.5 text-sm font-semibold text-white whitespace-nowrap transition-colors duration-150 hover:bg-slate-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600"
+                  disabled={photoUploading || cvUploading || submitting}
+                  className="inline-flex min-h-[48px] w-full items-center justify-center gap-2 rounded-lg bg-slate-900 px-6 py-3.5 text-sm font-semibold text-white whitespace-nowrap transition-colors duration-150 hover:bg-slate-800 disabled:cursor-wait disabled:opacity-70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600"
                 >
-                  Submit
+                  {submitting && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
+                  <span>
+                    {photoUploading || cvUploading
+                      ? 'Uploading files...'
+                      : submitting
+                      ? 'Submitting...'
+                      : 'Submit'}
+                  </span>
                 </button>
               </form>
             )}
